@@ -41,6 +41,7 @@ Schedule a job every 6 hours to check if my website is up and alert me on Slack 
 |---------|---------|
 | Schedule a job | `Schedule a daily job at 9am to...` |
 | List jobs | `Show my scheduled jobs` |
+| Get version | `Show scheduler version` |
 | Get job | `Show details for standing-desk` |
 | Update job | `Update standing-desk to run at 10am` |
 | Run immediately | `Run the standing-desk job now` |
@@ -89,6 +90,7 @@ Jobs use standard 5-field cron expressions:
 |------|-------------|
 | `schedule_job` | Create a new scheduled job |
 | `list_jobs` | List all scheduled jobs |
+| `get_version` | Show scheduler and opencode versions |
 | `get_job` | Fetch job details and metadata |
 | `update_job` | Update an existing job |
 | `delete_job` | Remove a scheduled job |

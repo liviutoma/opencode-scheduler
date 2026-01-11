@@ -14,9 +14,10 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "fs"
-import { join } from "path"
+import { dirname, join } from "path"
 import { homedir, platform } from "os"
 import { execSync, spawn, type ChildProcess } from "child_process"
+import { fileURLToPath } from "url"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -90,6 +91,21 @@ function okResult<T>(format: OutputFormat, output: string, data?: T): string {
 
 function errorResult<T>(format: OutputFormat, output: string, data?: T): string {
   return formatToolResult(format, { success: false, output, shouldContinue: true, data })
+}
+
+function loadPackageInfo(): { name: string; version: string } {
+  const fallback = { name: "opencode-scheduler", version: "unknown" }
+  try {
+    const packagePath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json")
+    const raw = readFileSync(packagePath, "utf-8")
+    const parsed = JSON.parse(raw) as { name?: string; version?: string }
+    return {
+      name: typeof parsed.name === "string" ? parsed.name : fallback.name,
+      version: typeof parsed.version === "string" ? parsed.version : fallback.version,
+    }
+  } catch {
+    return fallback
+  }
 }
 
 // Find opencode binary
@@ -608,6 +624,17 @@ function buildRunEnvironment(): NodeJS.ProcessEnv {
   }
 }
 
+function getOpencodeVersion(opencodePath: string): string | null {
+  try {
+    const output = execSync(`"${opencodePath}" --version`, { env: buildRunEnvironment() })
+      .toString()
+      .trim()
+    return output || null
+  } catch {
+    return null
+  }
+}
+
 function runJobNow(job: Job): { startedAt: string; logPath: string; pid?: number; job: Job | null } {
   ensureDir(LOGS_DIR)
   const startedAt = new Date().toISOString()
@@ -879,16 +906,39 @@ Commands:
           }
 
           const lines = jobs.map((j, i) => {
-            return `${i + 1}. ${j.name} (${j.slug})
-   ${describeCron(j.schedule)}
-   ${j.prompt.slice(0, 50)}${j.prompt.length > 50 ? "..." : ""}`
+            return `${i + 1}. ${j.name} (${j.slug})\n   ${describeCron(j.schedule)}\n   ${j.prompt.slice(0, 50)}${j.prompt.length > 50 ? "..." : ""}`
           })
 
           return okResult(format, `Scheduled Jobs\n\n${lines.join("\n\n")}`, { jobs })
         },
       }),
 
+      get_version: tool({
+        description: "Show the scheduler plugin version and opencode binary info.",
+        args: {
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format)
+          const packageInfo = loadPackageInfo()
+          const opencodePath = findOpencode()
+          const opencodeVersion = getOpencodeVersion(opencodePath)
+          const lines = [
+            `Scheduler Plugin: ${packageInfo.name}@${packageInfo.version}`,
+            `Opencode Binary: ${opencodePath}`,
+            `Opencode Version: ${opencodeVersion ?? "unknown"}`,
+          ]
+
+          return okResult(format, lines.join("\n"), {
+            plugin: packageInfo,
+            opencode: { path: opencodePath, version: opencodeVersion },
+            platform: platform(),
+          })
+        },
+      }),
+
       get_job: tool({
+
         description: "Get details for a scheduled job",
         args: {
           name: tool.schema.string().describe("The job name or slug"),

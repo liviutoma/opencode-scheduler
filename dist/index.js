@@ -12332,9 +12332,10 @@ function tool(input) {
 tool.schema = exports_external;
 // src/index.ts
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
 import { homedir, platform } from "os";
 import { execSync, spawn } from "child_process";
+import { fileURLToPath } from "url";
 var OPENCODE_CONFIG = join(homedir(), ".config", "opencode");
 var JOBS_DIR = join(OPENCODE_CONFIG, "jobs");
 var LOGS_DIR = join(OPENCODE_CONFIG, "logs");
@@ -12362,6 +12363,20 @@ function okResult(format, output, data) {
 }
 function errorResult(format, output, data) {
   return formatToolResult(format, { success: false, output, shouldContinue: true, data });
+}
+function loadPackageInfo() {
+  const fallback = { name: "opencode-scheduler", version: "unknown" };
+  try {
+    const packagePath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    const raw = readFileSync(packagePath, "utf-8");
+    const parsed = JSON.parse(raw);
+    return {
+      name: typeof parsed.name === "string" ? parsed.name : fallback.name,
+      version: typeof parsed.version === "string" ? parsed.version : fallback.version
+    };
+  } catch {
+    return fallback;
+  }
 }
 function findOpencode() {
   const paths = [
@@ -12772,6 +12787,14 @@ function buildRunEnvironment() {
     PATH: combinedPath
   };
 }
+function getOpencodeVersion(opencodePath) {
+  try {
+    const output = execSync(`"${opencodePath}" --version`, { env: buildRunEnvironment() }).toString().trim();
+    return output || null;
+  } catch {
+    return null;
+  }
+}
 function runJobNow(job) {
   ensureDir(LOGS_DIR);
   const startedAt = new Date().toISOString();
@@ -13014,6 +13037,29 @@ Try: "Schedule a daily job at 9am to search for standing desks"`;
 ${lines.join(`
 
 `)}`, { jobs });
+        }
+      }),
+      get_version: tool({
+        description: "Show the scheduler plugin version and opencode binary info.",
+        args: {
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format);
+          const packageInfo = loadPackageInfo();
+          const opencodePath = findOpencode();
+          const opencodeVersion = getOpencodeVersion(opencodePath);
+          const lines = [
+            `Scheduler Plugin: ${packageInfo.name}@${packageInfo.version}`,
+            `Opencode Binary: ${opencodePath}`,
+            `Opencode Version: ${opencodeVersion ?? "unknown"}`
+          ];
+          return okResult(format, lines.join(`
+`), {
+            plugin: packageInfo,
+            opencode: { path: opencodePath, version: opencodeVersion },
+            platform: platform()
+          });
         }
       }),
       get_job: tool({
