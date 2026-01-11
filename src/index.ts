@@ -13,10 +13,10 @@
  */
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "fs"
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "fs"
 import { join } from "path"
 import { homedir, platform } from "os"
-import { execSync } from "child_process"
+import { execSync, spawn, type ChildProcess } from "child_process"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -57,7 +57,39 @@ interface Job {
   prompt: string
   source?: string
   workdir?: string
+  attachUrl?: string
   createdAt: string
+  updatedAt?: string
+  lastRunAt?: string
+  lastRunExitCode?: number
+  lastRunError?: string
+  lastRunSource?: "manual" | "scheduled"
+  lastRunStatus?: "running" | "success" | "failed"
+}
+
+type OutputFormat = "text" | "json"
+
+interface ToolResult<T = unknown> {
+  success: boolean
+  output: string
+  shouldContinue: boolean
+  data?: T
+}
+
+function normalizeFormat(format?: string): OutputFormat {
+  return format === "json" ? "json" : "text"
+}
+
+function formatToolResult<T>(format: OutputFormat, result: ToolResult<T>): string {
+  return format === "json" ? JSON.stringify(result, null, 2) : result.output
+}
+
+function okResult<T>(format: OutputFormat, output: string, data?: T): string {
+  return formatToolResult(format, { success: true, output, shouldContinue: false, data })
+}
+
+function errorResult<T>(format: OutputFormat, output: string, data?: T): string {
+  return formatToolResult(format, { success: false, output, shouldContinue: true, data })
 }
 
 // Find opencode binary
@@ -90,45 +122,216 @@ function getEnhancedPath(): string {
   return paths.join(":")
 }
 
-// === LAUNCHD (Mac) ===
-
-function cronToLaunchdCalendar(cron: string): Record<string, number> {
-  const parts = cron.split(" ")
+function splitCronExpression(cron: string): [string, string, string, string, string] {
+  const parts = cron.trim().split(/\s+/)
   if (parts.length !== 5) {
     throw new Error(`Invalid cron: ${cron}`)
   }
-
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = parts
-  const calendar: Record<string, number> = {}
-
-  if (minute !== "*" && !minute.includes("/") && !minute.includes(",")) {
-    calendar.Minute = parseInt(minute)
-  }
-  if (hour !== "*" && !hour.includes("/") && !hour.includes(",")) {
-    calendar.Hour = parseInt(hour)
-  }
-  if (dayOfMonth !== "*" && !dayOfMonth.includes("/")) {
-    calendar.Day = parseInt(dayOfMonth)
-  }
-  if (month !== "*" && !month.includes("/")) {
-    calendar.Month = parseInt(month)
-  }
-  if (dayOfWeek !== "*" && !dayOfWeek.includes("/")) {
-    calendar.Weekday = parseInt(dayOfWeek)
-  }
-
-  return calendar
+  return parts as [string, string, string, string, string]
 }
+
+function uniqueSorted(values: number[]): number[] {
+  return Array.from(new Set(values)).sort((a, b) => a - b)
+}
+
+function parseCronField(
+  field: string,
+  min: number,
+  max: number,
+  label: string,
+  allowSundaySeven = false
+): number[] | null {
+  if (field === "*") return null
+
+  if (field.startsWith("*/")) {
+    const step = parseInt(field.slice(2), 10)
+    if (!Number.isFinite(step) || step <= 0) {
+      throw new Error(`Invalid cron ${label} step: ${field}`)
+    }
+    const values: number[] = []
+    for (let value = min; value <= max; value += step) {
+      values.push(value)
+    }
+    return values
+  }
+
+  const parts = field.split(",")
+  if (parts.length > 1) {
+    const values = parts.map((part) => parseCronNumber(part, min, max, label, allowSundaySeven))
+    return uniqueSorted(values)
+  }
+
+  if (/^\d+$/.test(field)) {
+    return [parseCronNumber(field, min, max, label, allowSundaySeven)]
+  }
+
+  throw new Error(`Invalid cron ${label} field: ${field}`)
+}
+
+function parseCronNumber(
+  value: string,
+  min: number,
+  max: number,
+  label: string,
+  allowSundaySeven: boolean
+): number {
+  const parsed = parseInt(value, 10)
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid cron ${label} value: ${value}`)
+  }
+  const normalized = allowSundaySeven && parsed === 7 ? 0 : parsed
+  if (normalized < min || normalized > max) {
+    throw new Error(`Invalid cron ${label} value: ${value}`)
+  }
+  return normalized
+}
+
+function validateCronExpression(cron: string): void {
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron)
+  parseCronField(minute, 0, 59, "minute")
+  parseCronField(hour, 0, 23, "hour")
+  parseCronField(dayOfMonth, 1, 31, "day of month")
+  parseCronField(month, 1, 12, "month")
+  parseCronField(dayOfWeek, 0, 7, "day of week", true)
+}
+
+function expandLaunchdEntries(
+  entries: Record<string, number>[],
+  key: string,
+  values: number[] | null
+): Record<string, number>[] {
+  if (!values) return entries
+  const expanded: Record<string, number>[] = []
+  for (const entry of entries) {
+    for (const value of values) {
+      expanded.push({ ...entry, [key]: value })
+    }
+  }
+  return expanded
+}
+
+function buildLaunchdCalendars(
+  minuteValues: number[] | null,
+  hourValues: number[] | null,
+  dayValues: number[] | null,
+  monthValues: number[] | null,
+  weekdayValues: number[] | null
+): Record<string, number>[] {
+  let entries: Record<string, number>[] = [{}]
+  entries = expandLaunchdEntries(entries, "Minute", minuteValues)
+  entries = expandLaunchdEntries(entries, "Hour", hourValues)
+  entries = expandLaunchdEntries(entries, "Day", dayValues)
+  entries = expandLaunchdEntries(entries, "Month", monthValues)
+  entries = expandLaunchdEntries(entries, "Weekday", weekdayValues)
+  return entries
+}
+
+function cronToLaunchdCalendars(cron: string): Record<string, number>[] {
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron)
+  const minuteValues = parseCronField(minute, 0, 59, "minute")
+  const hourValues = parseCronField(hour, 0, 23, "hour")
+  const dayValues = parseCronField(dayOfMonth, 1, 31, "day of month")
+  const monthValues = parseCronField(month, 1, 12, "month")
+  const weekdayValues = parseCronField(dayOfWeek, 0, 7, "day of week", true)
+
+  if (dayValues && weekdayValues) {
+    return [
+      ...buildLaunchdCalendars(minuteValues, hourValues, dayValues, monthValues, null),
+      ...buildLaunchdCalendars(minuteValues, hourValues, null, monthValues, weekdayValues),
+    ]
+  }
+
+  return buildLaunchdCalendars(minuteValues, hourValues, dayValues, monthValues, weekdayValues)
+}
+
+function escapePlistString(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+}
+
+function escapeSystemdArg(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+}
+
+function renderLaunchdCalendar(calendar: Record<string, number>): string {
+  return Object.entries(calendar)
+    .map(([key, value]) => `    <key>${key}</key>\n    <integer>${value}</integer>`)
+    .join("\n")
+}
+
+const SYSTEMD_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+function formatSystemdValue(value: number, size: number): string {
+  return value.toString().padStart(size, "0")
+}
+
+function cronToSystemdCalendars(cron: string): string[] {
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron)
+  const minuteValues = parseCronField(minute, 0, 59, "minute")
+  const hourValues = parseCronField(hour, 0, 23, "hour")
+  const dayValues = parseCronField(dayOfMonth, 1, 31, "day of month")
+  const monthValues = parseCronField(month, 1, 12, "month")
+  const weekdayValues = parseCronField(dayOfWeek, 0, 7, "day of week", true)
+
+  const minutes = minuteValues ? minuteValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
+  const hours = hourValues ? hourValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
+  const days = dayValues ? dayValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
+  const months = monthValues ? monthValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
+  const weekdays = weekdayValues
+    ? weekdayValues.map((value) => SYSTEMD_WEEKDAYS[value] ?? "*")
+    : ["*"]
+
+  const calendars: string[] = []
+
+  const buildCalendars = (domValues: string[], dowValues: string[]) => {
+    for (const minuteValue of minutes) {
+      for (const hourValue of hours) {
+        for (const domValue of domValues) {
+          for (const monthValue of months) {
+            for (const dowValue of dowValues) {
+              calendars.push(`${dowValue} *-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (dayValues && weekdayValues) {
+    buildCalendars(days, ["*"])
+    buildCalendars(["*"], weekdays)
+  } else {
+    buildCalendars(days, weekdays)
+  }
+
+  return calendars
+}
+
+// === LAUNCHD (Mac) ===
 
 function createLaunchdPlist(job: Job): string {
   const opencode = findOpencode()
   const label = `${LAUNCHD_PREFIX}.${job.slug}`
   const logPath = join(LOGS_DIR, `${job.slug}.log`)
 
-  const calendar = cronToLaunchdCalendar(job.schedule)
-  const calendarEntries = Object.entries(calendar)
-    .map(([k, v]) => `    <key>${k}</key>\n    <integer>${v}</integer>`)
-    .join("\n")
+  const calendars = cronToLaunchdCalendars(job.schedule)
+  const calendarXml =
+    calendars.length === 1
+      ? `  <dict>\n${renderLaunchdCalendar(calendars[0])}\n  </dict>`
+      : `  <array>\n${calendars
+          .map((calendar) => `  <dict>\n${renderLaunchdCalendar(calendar)}\n  </dict>`)
+          .join("\n")}\n  </array>`
+
+  const programArguments = [
+    `    <string>${escapePlistString(opencode)}</string>`,
+    "    <string>run</string>",
+    ...(job.attachUrl
+      ? [
+          "    <string>--attach</string>",
+          `    <string>${escapePlistString(job.attachUrl)}</string>`,
+        ]
+      : []),
+    `    <string>${escapePlistString(job.prompt)}</string>`,
+  ].join("\n")
 
   // Use workdir if specified, otherwise default to home directory
   const workdir = job.workdir || homedir()
@@ -142,7 +345,7 @@ function createLaunchdPlist(job: Job): string {
   <string>${label}</string>
   
   <key>WorkingDirectory</key>
-  <string>${workdir}</string>
+  <string>${escapePlistString(workdir)}</string>
   
   <key>EnvironmentVariables</key>
   <dict>
@@ -152,15 +355,11 @@ function createLaunchdPlist(job: Job): string {
   
   <key>ProgramArguments</key>
   <array>
-    <string>${opencode}</string>
-    <string>run</string>
-    <string>${job.prompt.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</string>
+${programArguments}
   </array>
   
   <key>StartCalendarInterval</key>
-  <dict>
-${calendarEntries}
-  </dict>
+${calendarXml}
   
   <key>StandardOutPath</key>
   <string>${logPath}</string>
@@ -173,6 +372,7 @@ ${calendarEntries}
 </dict>
 </plist>`
 }
+
 
 function installLaunchdJob(job: Job): void {
   ensureDir(LAUNCH_AGENTS_DIR)
@@ -208,38 +408,12 @@ function uninstallLaunchdJob(slug: string): void {
 
 // === SYSTEMD (Linux) ===
 
-function cronToSystemdCalendar(cron: string): string {
-  const parts = cron.split(" ")
-  if (parts.length !== 5) {
-    throw new Error(`Invalid cron: ${cron}`)
-  }
-
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = parts
-
-  // Handle common patterns
-  if (dayOfWeek !== "*" && dayOfMonth === "*") {
-    // Weekly
-    const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-    const day = days[parseInt(dayOfWeek)] || dayOfWeek
-    const h = hour === "*" ? "00" : hour.padStart(2, "0")
-    const m = minute === "*" ? "00" : minute.padStart(2, "0")
-    return `${day} *-*-* ${h}:${m}:00`
-  }
-
-  // Daily or more specific
-  const h = hour === "*" ? "*" : hour.padStart(2, "0")
-  const m = minute === "*" ? "*" : minute.padStart(2, "0")
-  const dom = dayOfMonth === "*" ? "*" : dayOfMonth.padStart(2, "0")
-  const mon = month === "*" ? "*" : month.padStart(2, "0")
-
-  return `*-${mon}-${dom} ${h}:${m}:00`
-}
-
 function createSystemdService(job: Job): string {
   const opencode = findOpencode()
   const logPath = join(LOGS_DIR, `${job.slug}.log`)
   const workdir = job.workdir || homedir()
   const enhancedPath = getEnhancedPath()
+  const attachArgs = job.attachUrl ? ` --attach "${escapeSystemdArg(job.attachUrl)}"` : ""
 
   return `[Unit]
 Description=OpenCode Job: ${job.name}
@@ -248,7 +422,7 @@ Description=OpenCode Job: ${job.name}
 Type=oneshot
 WorkingDirectory=${workdir}
 Environment="PATH=${enhancedPath}"
-ExecStart=${opencode} run "${job.prompt.replace(/"/g, '\\"')}"
+ExecStart=${opencode} run${attachArgs} "${escapeSystemdArg(job.prompt)}"
 StandardOutput=append:${logPath}
 StandardError=append:${logPath}
 
@@ -258,13 +432,14 @@ WantedBy=default.target
 }
 
 function createSystemdTimer(job: Job): string {
-  const calendar = cronToSystemdCalendar(job.schedule)
+  const calendars = cronToSystemdCalendars(job.schedule)
+  const calendarLines = calendars.map((calendar) => `OnCalendar=${calendar}`).join("\n")
 
   return `[Unit]
 Description=Timer for OpenCode Job: ${job.name}
 
 [Timer]
-OnCalendar=${calendar}
+${calendarLines}
 Persistent=true
 
 [Install]
@@ -366,6 +541,137 @@ function deleteJobFile(slug: string): void {
   }
 }
 
+function normalizeAttachUrl(attachUrl?: string): string | undefined {
+  if (attachUrl === undefined) return undefined
+  const trimmed = attachUrl.trim()
+  if (!trimmed) return undefined
+  try {
+    new URL(trimmed)
+  } catch {
+    throw new Error(`Invalid attach URL: ${attachUrl}`)
+  }
+  return trimmed
+}
+
+function findJobByName(name: string): Job | null {
+  const slug = slugify(name)
+  let job = loadJob(slug) || loadJob(name)
+
+  if (!job) {
+    const allJobs = loadAllJobs()
+    job =
+      allJobs.find(
+        (j) =>
+          j.slug === name ||
+          j.slug.endsWith(`-${slug}`) ||
+          j.name.toLowerCase() === name.toLowerCase() ||
+          j.name.toLowerCase().includes(name.toLowerCase())
+      ) || null
+  }
+
+  return job
+}
+
+function updateJobRecord(slug: string, updates: Partial<Job>): Job | null {
+  const job = loadJob(slug)
+  if (!job) return null
+  const updated: Job = {
+    ...job,
+    ...updates,
+    updatedAt: new Date().toISOString(),
+  }
+  saveJob(updated)
+  return updated
+}
+
+function getLogPath(slug: string): string {
+  return join(LOGS_DIR, `${slug}.log`)
+}
+
+function buildOpencodeArgs(job: Job): { command: string; args: string[] } {
+  const command = findOpencode()
+  const args = ["run"]
+  if (job.attachUrl) {
+    args.push("--attach", job.attachUrl)
+  }
+  args.push(job.prompt)
+  return { command, args }
+}
+
+function buildRunEnvironment(): NodeJS.ProcessEnv {
+  const enhancedPath = getEnhancedPath()
+  const existingPath = process.env.PATH
+  const combinedPath = existingPath ? `${enhancedPath}:${existingPath}` : enhancedPath
+  return {
+    ...process.env,
+    PATH: combinedPath,
+  }
+}
+
+function runJobNow(job: Job): { startedAt: string; logPath: string; pid?: number; job: Job | null } {
+  ensureDir(LOGS_DIR)
+  const startedAt = new Date().toISOString()
+  const logPath = getLogPath(job.slug)
+  const logStream = createWriteStream(logPath, { flags: "a" })
+  const workdir = job.workdir || homedir()
+
+  logStream.write(`\n=== Manual run ${startedAt} ===\n`)
+
+  const { command, args } = buildOpencodeArgs(job)
+  let child: ChildProcess
+  try {
+    child = spawn(command, args, {
+      cwd: workdir,
+      env: buildRunEnvironment(),
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    logStream.write(`\n=== Run error ${new Date().toISOString()} ===\n${message}\n`)
+    logStream.end()
+    updateJobRecord(job.slug, {
+      lastRunStatus: "failed",
+      lastRunExitCode: undefined,
+      lastRunError: message,
+    })
+    throw error
+  }
+
+  const runningJob = updateJobRecord(job.slug, {
+    lastRunAt: startedAt,
+    lastRunSource: "manual",
+    lastRunStatus: "running",
+    lastRunExitCode: undefined,
+    lastRunError: undefined,
+  })
+
+  if (child.stdout) child.stdout.pipe(logStream)
+  if (child.stderr) child.stderr.pipe(logStream)
+
+  child.on("error", (error) => {
+    logStream.write(`\n=== Run error ${new Date().toISOString()} ===\n${error.message}\n`)
+    logStream.end()
+    updateJobRecord(job.slug, {
+      lastRunStatus: "failed",
+      lastRunExitCode: undefined,
+      lastRunError: error.message,
+    })
+  })
+
+  child.on("close", (code) => {
+    const exitCode = typeof code === "number" ? code : undefined
+    logStream.write(`\n=== Run complete (${exitCode ?? "unknown"}) ${new Date().toISOString()} ===\n`)
+    logStream.end()
+    updateJobRecord(job.slug, {
+      lastRunStatus: exitCode === 0 ? "success" : "failed",
+      lastRunExitCode: exitCode,
+      lastRunError: exitCode === 0 ? undefined : `Exit code ${exitCode ?? "unknown"}`,
+    })
+  })
+
+  return { startedAt, logPath, pid: child.pid, job: runningJob }
+}
+
 // === HELPERS ===
 
 function describeCron(cron: string): string {
@@ -404,8 +710,50 @@ function describeCron(cron: string): string {
   return cron
 }
 
+function formatJobDetails(job: Job): string {
+  const lines = [
+    `Job: ${job.name}`,
+    `Slug: ${job.slug}`,
+    `Schedule: ${job.schedule} (${describeCron(job.schedule)})`,
+    `Working Directory: ${job.workdir || homedir()}`,
+  ]
+
+  if (job.attachUrl) {
+    lines.push(`Attach URL: ${job.attachUrl}`)
+  }
+
+  lines.push(`Prompt: ${job.prompt}`)
+  lines.push(`Created: ${job.createdAt}`)
+
+  if (job.updatedAt) {
+    lines.push(`Updated: ${job.updatedAt}`)
+  }
+
+  if (job.lastRunAt) {
+    lines.push(`Last Run: ${job.lastRunAt}`)
+  }
+
+  if (job.lastRunSource) {
+    lines.push(`Last Run Source: ${job.lastRunSource}`)
+  }
+
+  if (job.lastRunStatus) {
+    lines.push(`Last Run Status: ${job.lastRunStatus}`)
+  }
+
+  if (job.lastRunExitCode !== undefined) {
+    lines.push(`Last Exit Code: ${job.lastRunExitCode}`)
+  }
+
+  if (job.lastRunError) {
+    lines.push(`Last Error: ${job.lastRunError}`)
+  }
+
+  return lines.join("\n")
+}
+
 function getJobLogs(slug: string): string | null {
-  const logPath = join(LOGS_DIR, `${slug}.log`)
+  const logPath = getLogPath(slug)
   if (!existsSync(logPath)) return null
   try {
     const content = readFileSync(logPath, "utf-8")
@@ -434,12 +782,33 @@ export const SchedulerPlugin: Plugin = async () => {
             .string()
             .optional()
             .describe("Optional: working directory to run from (for MCP config). Defaults to current directory."),
+          attachUrl: tool.schema
+            .string()
+            .optional()
+            .describe("Optional: attach URL for opencode run (e.g. http://localhost:4096)."),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
         },
         async execute(args) {
+          const format = normalizeFormat(args.format)
           const slug = args.source ? `${args.source}-${slugify(args.name)}` : slugify(args.name)
 
           if (loadJob(slug)) {
-            return `Job "${slug}" already exists. Delete it first or use a different name.`
+            return errorResult(format, `Job "${slug}" already exists. Delete it first or use a different name.`)
+          }
+
+          let attachUrl: string | undefined
+          try {
+            attachUrl = normalizeAttachUrl(args.attachUrl)
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error)
+            return errorResult(format, msg)
+          }
+
+          try {
+            validateCronExpression(args.schedule)
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error)
+            return errorResult(format, `Invalid cron schedule: ${msg}`)
           }
 
           // Use provided workdir, or fall back to current directory
@@ -452,6 +821,7 @@ export const SchedulerPlugin: Plugin = async () => {
             prompt: args.prompt,
             source: args.source,
             workdir,
+            attachUrl,
             createdAt: new Date().toISOString(),
           }
 
@@ -460,24 +830,29 @@ export const SchedulerPlugin: Plugin = async () => {
             installJob(job)
 
             const platformName = IS_MAC ? "launchd" : IS_LINUX ? "systemd" : "unknown"
+            const attachLine = attachUrl ? `Attach URL: ${attachUrl}\n` : ""
 
-            return `Scheduled "${args.name}"
+            return okResult(
+              format,
+              `Scheduled "${args.name}"
 
 Schedule: ${args.schedule} (${describeCron(args.schedule)})
 Platform: ${platformName}
 Working Directory: ${workdir}
-Prompt: ${args.prompt.slice(0, 100)}${args.prompt.length > 100 ? "..." : ""}
+${attachLine}Prompt: ${args.prompt.slice(0, 100)}${args.prompt.length > 100 ? "..." : ""}
 
 The job will run at the scheduled time. If your computer was asleep, it will catch up when it wakes.
 
 Commands:
 - "run ${args.name} now" - run immediately
 - "show my jobs" - list all
-- "delete job ${args.name}" - remove`
+- "delete job ${args.name}" - remove`,
+              { job }
+            )
           } catch (error) {
             deleteJobFile(slug)
             const msg = error instanceof Error ? error.message : String(error)
-            return `Failed to schedule job: ${msg}`
+            return errorResult(format, `Failed to schedule job: ${msg}`)
           }
         },
       }),
@@ -486,8 +861,10 @@ Commands:
         description: "List all scheduled jobs. Optionally filter by source app.",
         args: {
           source: tool.schema.string().optional().describe("Filter by source app (e.g. 'marketplace')"),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
         },
         async execute(args) {
+          const format = normalizeFormat(args.format)
           let jobs = loadAllJobs()
 
           if (args.source) {
@@ -495,9 +872,10 @@ Commands:
           }
 
           if (jobs.length === 0) {
-            return args.source
+            const message = args.source
               ? `No jobs found for "${args.source}".`
               : 'No scheduled jobs yet.\n\nTry: "Schedule a daily job at 9am to search for standing desks"'
+            return okResult(format, message, { jobs: [] })
           }
 
           const lines = jobs.map((j, i) => {
@@ -506,7 +884,106 @@ Commands:
    ${j.prompt.slice(0, 50)}${j.prompt.length > 50 ? "..." : ""}`
           })
 
-          return `Scheduled Jobs\n\n${lines.join("\n\n")}`
+          return okResult(format, `Scheduled Jobs\n\n${lines.join("\n\n")}`, { jobs })
+        },
+      }),
+
+      get_job: tool({
+        description: "Get details for a scheduled job",
+        args: {
+          name: tool.schema.string().describe("The job name or slug"),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format)
+          const job = findJobByName(args.name)
+
+          if (!job) {
+            return errorResult(format, `Job "${args.name}" not found.`)
+          }
+
+          return okResult(format, formatJobDetails(job), { job })
+        },
+      }),
+
+      update_job: tool({
+        description: "Update a scheduled job",
+        args: {
+          name: tool.schema.string().describe("The job name or slug"),
+          schedule: tool.schema.string().optional().describe("Updated cron expression"),
+          prompt: tool.schema.string().optional().describe("Updated prompt"),
+          workdir: tool.schema.string().optional().describe("Updated working directory"),
+          attachUrl: tool.schema.string().optional().describe("Updated attach URL (set to empty to clear)"),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format)
+          const job = findJobByName(args.name)
+
+          if (!job) {
+            return errorResult(format, `Job "${args.name}" not found.`)
+          }
+
+          const updates: Partial<Job> = {}
+
+          if (args.schedule !== undefined) {
+            if (!args.schedule.trim()) {
+              return errorResult(format, "Schedule cannot be empty.")
+            }
+            try {
+              validateCronExpression(args.schedule)
+            } catch (error) {
+              const msg = error instanceof Error ? error.message : String(error)
+              return errorResult(format, `Invalid cron schedule: ${msg}`)
+            }
+            updates.schedule = args.schedule
+          }
+
+          if (args.prompt !== undefined) {
+            if (!args.prompt.trim()) {
+              return errorResult(format, "Prompt cannot be empty.")
+            }
+            updates.prompt = args.prompt
+          }
+
+          if (args.workdir !== undefined) {
+            if (!args.workdir.trim()) {
+              return errorResult(format, "Working directory cannot be empty.")
+            }
+            updates.workdir = args.workdir
+          }
+
+          if (args.attachUrl !== undefined) {
+            try {
+              updates.attachUrl = normalizeAttachUrl(args.attachUrl)
+            } catch (error) {
+              const msg = error instanceof Error ? error.message : String(error)
+              return errorResult(format, msg)
+            }
+          }
+
+          if (Object.keys(updates).length === 0) {
+            return errorResult(format, "No updates provided.")
+          }
+
+          const updatedJob: Job = {
+            ...job,
+            ...updates,
+            updatedAt: new Date().toISOString(),
+          }
+
+          try {
+            saveJob(updatedJob)
+            installJob(updatedJob)
+            return okResult(format, `Updated job "${updatedJob.name}"`, { job: updatedJob })
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error)
+            saveJob(job)
+            try {
+              installJob(job)
+            } catch {}
+            return errorResult(format, `Failed to update job: ${msg}`)
+          }
         },
       }),
 
@@ -514,28 +991,20 @@ Commands:
         description: "Delete a scheduled job",
         args: {
           name: tool.schema.string().describe("The job name or slug to delete"),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
         },
         async execute(args) {
-          const slug = slugify(args.name)
-          let job = loadJob(slug) || loadJob(args.name)
-
-          // Try with common prefixes if not found
-          if (!job) {
-            const allJobs = loadAllJobs()
-            job =
-              allJobs.find(
-                (j) => j.slug === args.name || j.slug.endsWith(`-${slug}`) || j.name.toLowerCase() === args.name.toLowerCase()
-              ) || null
-          }
+          const format = normalizeFormat(args.format)
+          const job = findJobByName(args.name)
 
           if (!job) {
-            return `Job "${args.name}" not found.`
+            return errorResult(format, `Job "${args.name}" not found.`)
           }
 
           uninstallJob(job.slug)
           deleteJobFile(job.slug)
 
-          return `Deleted job "${job.name}"`
+          return okResult(format, `Deleted job "${job.name}"`, { job })
         },
       }),
 
@@ -543,26 +1012,38 @@ Commands:
         description: "Run a scheduled job immediately",
         args: {
           name: tool.schema.string().describe("The job name or slug"),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
         },
         async execute(args) {
-          const slug = slugify(args.name)
-          let job = loadJob(slug) || loadJob(args.name)
+          const format = normalizeFormat(args.format)
+          const job = findJobByName(args.name)
 
           if (!job) {
-            const allJobs = loadAllJobs()
-            job =
-              allJobs.find(
-                (j) =>
-                  j.slug === args.name || j.slug.endsWith(`-${slug}`) || j.name.toLowerCase().includes(args.name.toLowerCase())
-              ) || null
+            return errorResult(format, `Job "${args.name}" not found. Use list_jobs to see available jobs.`)
           }
 
-          if (!job) {
-            return `Job "${args.name}" not found. Use list_jobs to see available jobs.`
+          let runResult
+          try {
+            runResult = runJobNow(job)
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error)
+            return errorResult(format, `Failed to start job "${job.name}": ${msg}`)
           }
 
-          // Return the prompt for OpenCode to execute
-          return `Running "${job.name}" now...\n\n---\n\n${job.prompt}`
+          const logs = getJobLogs(job.slug)
+          const attachHint = job.attachUrl ? `\nAttach: opencode attach ${job.attachUrl}` : ""
+          const logSection = logs ? `\nLatest logs:\n${logs}` : "\nNo logs yet. Check again soon."
+
+          return okResult(
+            format,
+            `Triggered "${job.name}" (fire-and-forget).\nLogs: ${runResult.logPath}${attachHint}${logSection}`,
+            {
+              job: runResult.job ?? job,
+              startedAt: runResult.startedAt,
+              logPath: runResult.logPath,
+              pid: runResult.pid,
+            }
+          )
         },
       }),
 
@@ -570,31 +1051,28 @@ Commands:
         description: "View the latest logs from a scheduled job",
         args: {
           name: tool.schema.string().describe("The job name or slug"),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
         },
         async execute(args) {
-          const slug = slugify(args.name)
-          let job = loadJob(slug) || loadJob(args.name)
+          const format = normalizeFormat(args.format)
+          const job = findJobByName(args.name)
 
           if (!job) {
-            const allJobs = loadAllJobs()
-            job =
-              allJobs.find(
-                (j) =>
-                  j.slug === args.name || j.slug.endsWith(`-${slug}`) || j.name.toLowerCase().includes(args.name.toLowerCase())
-              ) || null
-          }
-
-          if (!job) {
-            return `Job "${args.name}" not found.`
+            return errorResult(format, `Job "${args.name}" not found.`)
           }
 
           const logs = getJobLogs(job.slug)
+          const logPath = getLogPath(job.slug)
 
           if (!logs) {
-            return `No logs found for "${job.name}". The job may not have run yet.`
+            return okResult(format, `No logs found for "${job.name}". The job may not have run yet.`, {
+              job,
+              logPath,
+              logs: "",
+            })
           }
 
-          return `Logs for ${job.name}\n\n${logs}`
+          return okResult(format, `Logs for ${job.name}\n\n${logs}`, { job, logPath, logs })
         },
       }),
     },

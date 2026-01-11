@@ -41,6 +41,8 @@ Schedule a job every 6 hours to check if my website is up and alert me on Slack 
 |---------|---------|
 | Schedule a job | `Schedule a daily job at 9am to...` |
 | List jobs | `Show my scheduled jobs` |
+| Get job | `Show details for standing-desk` |
+| Update job | `Update standing-desk to run at 10am` |
 | Run immediately | `Run the standing-desk job now` |
 | View logs | `Show logs for standing-desk` |
 | Delete | `Delete the standing-desk job` |
@@ -51,6 +53,8 @@ Schedule a job every 6 hours to check if my website is up and alert me on Slack 
 2. The plugin creates a cron job and installs it in your OS scheduler
 3. At the scheduled time, OpenCode runs your prompt autonomously
 4. Output is logged to `~/.config/opencode/logs/`
+
+You can also trigger a job immediately via `run_job`—it runs fire-and-forget and appends to the same log file.
 
 Jobs run from the working directory where you created them, picking up your `opencode.json` and MCP configurations.
 
@@ -85,9 +89,13 @@ Jobs use standard 5-field cron expressions:
 |------|-------------|
 | `schedule_job` | Create a new scheduled job |
 | `list_jobs` | List all scheduled jobs |
+| `get_job` | Fetch job details and metadata |
+| `update_job` | Update an existing job |
 | `delete_job` | Remove a scheduled job |
-| `run_job` | Execute a job immediately |
+| `run_job` | Execute a job immediately (fire-and-forget) |
 | `job_logs` | View logs from a job |
+
+Tools accept an optional `format: "json"` argument to return structured output with `success`, `output`, `shouldContinue`, and `data`.
 
 ### Storage
 
@@ -107,6 +115,14 @@ Schedule a daily job at 9am from /path/to/project to run my-task
 ```
 
 By default, jobs use the directory where you created them.
+
+### Attach URL (optional)
+
+If you have an OpenCode backend running via `opencode serve` or `opencode web`, you can set `attachUrl` on a job so runs use that backend:
+
+```
+Update the standing-desk job to use attachUrl http://localhost:4096
+```
 
 ## Troubleshooting
 
