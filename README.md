@@ -132,8 +132,6 @@ Update the standing-desk job to use attachUrl http://localhost:4096
 ## Project Philosophy
 
 - This plugin is intentionally a thin wrapper: it schedules `opencode run` via launchd (Mac) or systemd (Linux).
-- We avoid prompt “injection” as a feature. If a job needs dynamic values (dates, paths, etc.), the prompt should compute them at runtime using tools.
-- Prefer non-interactive dependencies for scheduled runs (e.g., Telegram Bot API over `web.telegram.org`).
 - Logs are the source of truth for scheduled runs: `~/.config/opencode/logs/*.log`.
 - Resiliency/reporting roadmap (not implemented): `PRD-resilient-execution.md`.
 
