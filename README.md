@@ -138,7 +138,15 @@ Update the standing-desk job to use attachUrl http://localhost:4096
 
 ### Built-in Skill Templates
 
-Use `get_skill` to fetch `scheduled-job-best-practices`, copy it into your repo, then add `@scheduled-job-best-practices` at the top of scheduled job prompts.
+To install the built-in skill into your project, open OpenCode in your repo and run this prompt:
+
+```
+Get skill from opencode-scheduler and add it to my skills
+```
+
+Then add `@scheduled-job-best-practices` at the top of scheduled job prompts.
+
+(Manual option: use `get_skill` to fetch `scheduled-job-best-practices` and copy it into `.opencode/skill/scheduled-job-best-practices/SKILL.md`.)
 
 ## Troubleshooting
 
