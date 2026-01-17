@@ -288,10 +288,35 @@ function loadPackageInfo(): { name: string; version: string } {
 
 // Find opencode binary
 function findOpencode(): string {
+  // Allow explicit override for edge cases (multiple installs, etc.)
+  const override = process.env.OPENCODE_SCHEDULER_OPENCODE_PATH?.trim()
+  if (override) return override
+
+  // Prefer PATH resolution so the scheduler uses the same `opencode` as the user.
+  // This fixes cases where an old install exists at ~/.opencode/bin/opencode.
+  try {
+    const resolved = execSync("command -v opencode", {
+      env: { ...process.env, PATH: getEnhancedPath() + ":" + (process.env.PATH ?? "") },
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim()
+
+    if (resolved) {
+      // If command -v returns a path, prefer it.
+      if (resolved.includes("/")) return resolved
+      // Fallback: let the OS resolve via PATH at runtime.
+      return "opencode"
+    }
+  } catch {
+    // ignore
+  }
+
+  // Fallbacks (common install locations)
   const paths = [
-    join(homedir(), ".opencode", "bin", "opencode"),
-    "/usr/local/bin/opencode",
     "/opt/homebrew/bin/opencode",
+    "/usr/local/bin/opencode",
+    join(homedir(), ".opencode", "bin", "opencode"),
   ]
 
   for (const p of paths) {
